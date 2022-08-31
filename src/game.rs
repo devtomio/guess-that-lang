@@ -1,24 +1,30 @@
 use std::{
-    sync::{mpsc, Mutex},
+    io::stdout,
+    ops::ControlFlow,
+    sync::{
+        mpsc::{self, Receiver},
+        Mutex,
+    },
     thread,
     time::Duration,
 };
 
-use ansi_term::Color;
 use crossterm::{
-    cursor::Show,
+    cursor::{MoveTo, Show},
     execute,
-    terminal::{disable_raw_mode, LeaveAlternateScreen},
+    style::Stylize,
+    terminal::{disable_raw_mode, Clear, ClearType, LeaveAlternateScreen},
 };
 use rand::{seq::SliceRandom, thread_rng};
 
 use crate::{
-    github::{GistData, Github},
+    providers::{gists::GistProvider, repos::RepositoryProvider, GithubProvider},
     terminal::Terminal,
+    Config, Result, ARGS, CONFIG,
 };
 
 /// The prompt to be shown before the options in [`Terminal::print_round_info`].
-pub const PROMPT: &str = "Which programming language is this? (Type the corresponsing number)";
+pub const PROMPT: &str = "Which programming language is this? (Type the corresponding number)";
 
 /// All valid languages (top 24 from the Stack Overflow 2022 Developer survey,
 /// but substituting VBA for Dockerfile).
@@ -50,49 +56,72 @@ pub const LANGUAGES: [&str; 25] = [
     "TypeScript",
 ];
 
-/// The necessary behavior after each round (exit if the user quits or gets the
-/// answer incorrect, continue otherwise).
-pub enum GameResult {
-    Continue,
-    Exit,
-}
-
 /// The all-encompassing game struct.
-#[derive(Default)]
 pub struct Game {
     pub points: u32,
     pub terminal: Terminal,
-    client: Github,
-    gist_data: Vec<GistData>,
+    pub provider: Box<dyn GithubProvider>,
 }
 
 /// Cleanup terminal after the Game is over (this will also account for
 /// unexpected errors).
 impl Drop for Game {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.stdout, Show, LeaveAlternateScreen);
+        let _raw = disable_raw_mode();
+        let _leave = execute!(self.terminal.stdout, Show, LeaveAlternateScreen);
 
         println!(
-            "You scored {} points!",
-            Color::Green.bold().paint(self.points.to_string())
+            "\nYou scored {} points!",
+            self.points.to_string().green().bold()
         );
+
+        if self.points > CONFIG.high_score {
+            if CONFIG.high_score > 0 {
+                println!(
+                    "You beat your high score of {}!\n\nShare it: {}",
+                    CONFIG.high_score.to_string().magenta().bold(),
+                    "https://github.com/Lioness100/guess-that-lang/discussions/6"
+                        .cyan()
+                        .bold()
+                );
+            }
+
+            let new_config = Config {
+                high_score: self.points,
+                ..CONFIG.clone()
+            };
+
+            let _config = confy::store("guess-that-lang", new_config);
+        }
     }
 }
 
 impl Game {
     /// Create new game.
-    pub fn new(client: Github) -> Self {
-        let mut game: Self = Default::default();
-        game.client = client;
+    pub fn new() -> Result<Self> {
+        let provider: Box<dyn GithubProvider> = match ARGS
+            .provider
+            .as_ref()
+            .unwrap_or(&String::from("repos"))
+            .as_str()
+        {
+            "gists" => Box::new(GistProvider::new()?),
+            "repos" => Box::new(RepositoryProvider::new()?),
+            _ => return Err("Invalid github provider (repos/gists)".into()),
+        };
 
-        game
+        Ok(Self {
+            points: 0,
+            terminal: Terminal::new()?,
+            provider,
+        })
     }
 
     /// Get the language options for a round. This will choose 3 random unique
     /// languages, push them to a vec along with the correct language, and
     /// shuffle the vec.
-    fn get_options(correct_language: &str) -> Vec<&str> {
+    #[must_use]
+    pub fn get_options(correct_language: &str) -> Vec<&str> {
         let mut options = Vec::<&str>::with_capacity(4);
         options.push(correct_language);
 
@@ -109,58 +138,89 @@ impl Game {
     }
 
     /// Start a new round, which is called in the main function with a for loop.
-    /// The loop will break if [`GameResult::Exit`] is returned.
-    pub fn start_new_round(&mut self) -> anyhow::Result<GameResult> {
-        if self.gist_data.is_empty() {
-            self.gist_data = self.client.get_gists(&self.terminal.syntaxes)?;
+    pub fn start_new_round(&mut self, preloader: Option<Receiver<()>>) -> Result<ControlFlow<()>> {
+        let data = self.provider.get_code()?;
+        let width = Terminal::width()?;
+
+        let highlighter = self.terminal.get_highlighter(&data.language);
+        let code = match self.terminal.parse_code(&data.code, highlighter, &width) {
+            Some(code) => code,
+            // If there is no valid code, skip this round via recursion.
+            None => return self.start_new_round(preloader),
+        };
+
+        let options = Self::get_options(&data.language);
+
+        if let Some(preloader) = preloader {
+            let _ = preloader.recv();
         }
 
-        let gist = self.gist_data.pop().unwrap();
-        let code = self.client.get_gist(&gist.url)?;
-
-        let options = Self::get_options(&gist.language);
         self.terminal
-            .print_round_info(self.points, &options, Terminal::trim_code(&code));
+            .print_round_info(&options, &code, &width, self.points)?;
 
         let available_points = Mutex::new(100.0);
         let (sender, receiver) = mpsc::channel();
 
         // [`Terminal::start_showing_code`] and [`Terminal::read_input_char`]
         // both create blocking loops, so they have to be used in separate threads.
-        crossbeam_utils::thread::scope(|s| {
-            let display = s.spawn(|_| {
-                self.terminal.start_showing_code(
-                    Terminal::trim_code(&code),
-                    &gist.extension,
-                    &available_points,
-                    receiver,
-                );
+        thread::scope(|s| {
+            let display = s.spawn(|| {
+                self.terminal
+                    .start_showing_code(&code, &available_points, receiver)
             });
 
-            let input = s.spawn(|_| {
-                let char = Terminal::read_input_char();
-                if char == 'q' {
-                    sender.send(()).unwrap();
-                    Ok(GameResult::Exit)
+            let input = s.spawn(|| {
+                let input = Terminal::read_input_char()?;
+
+                // Notifies [`Terminal::start_showing_code`] to not show the
+                // next line.
+                let sender = sender;
+                let _ = sender.send(());
+
+                if input == 'q' || input == 'c' {
+                    Ok(ControlFlow::Break(()))
                 } else {
                     let result = self.terminal.process_input(
-                        sender,
-                        char.to_digit(10).unwrap(),
+                        input.to_digit(10).ok_or("invalid input")?,
                         &options,
-                        &gist.language,
+                        &data.language,
                         &available_points,
                         &mut self.points,
                     );
 
-                    // Give the user 1.5 seconds to register the result.
-                    thread::sleep(Duration::from_millis(1500));
+                    // Let the user visually process the result. If they got it
+                    // correct, the timer is set after a thread is spawned to
+                    // preload the next round's gist.
+                    if let Ok(ControlFlow::Break(())) = result {
+                        thread::sleep(Duration::from_millis(1500));
+                    }
+
                     result
                 }
             });
 
-            display.join().unwrap();
+            display.join().unwrap()?;
             input.join().unwrap()
         })
-        .unwrap()
+    }
+
+    /// Wait 1.5 seconds for the user to visually process they got the right
+    /// answer while the next round is preloading, then start the next round.
+    pub fn start_next_round(&mut self) -> Result<ControlFlow<()>> {
+        let (sender, receiver) = mpsc::channel();
+
+        thread::scope(|s| {
+            let handle = s.spawn(|| self.start_new_round(Some(receiver)));
+
+            thread::sleep(Duration::from_millis(1500));
+
+            // Clear the screen and move to the top right corner. This is not
+            // a method of [`Terminal`] because it would take a lot of work to
+            // let the borrow checker let me use `self` again.
+            let _clear = execute!(stdout().lock(), Clear(ClearType::All), MoveTo(0, 0));
+            let _ = sender.send(());
+
+            handle.join().unwrap()
+        })
     }
 }
